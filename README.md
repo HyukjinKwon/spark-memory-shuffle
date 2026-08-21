@@ -10,6 +10,32 @@ heap. The fast path is pure memory-to-memory; disk is the bounded fallback under
 
 Built and tested against **Apache Spark 4.2.0** (Scala 2.13).
 
+## TL;DR -- how it works, before vs after
+
+**Before (`SortShuffleManager`, the default):** every map task sorts and serializes its output and
+writes it to a local **shuffle data file + index file**; reducers then fetch byte ranges of those
+files (over the network, or via the External Shuffle Service). Every shuffle round-trips through
+the local filesystem.
+
+```
+map task --serialize--> [ shuffle_X.data + shuffle_X.index on local disk ] --network--> reduce task
+```
+
+**After (`MemoryShuffleManager`):** each map task's partitioned output stays in **executor memory**
+as buffers; reducers fetch them over the *same* Netty path, served straight from RAM. No shuffle
+files on the happy path. Under memory pressure an individual block **spills to a local file** and is
+served from there, so the heap is bounded. The write path still reuses Spark's `ExternalSorter`
+(combine / sort / compress / checksums) unchanged -- only the *sink* changes from file to memory.
+
+```
+map task --serialize--> [ per-partition buffers in RAM ]  --network--> reduce task
+                              \--(only if pool full)--> local file
+```
+
+Net effect: the shuffle-*write* cost drops ~25-67x (no file/index materialization -- see
+[Benchmark](#benchmark)); end-to-end wall-clock improves most where local-disk IO is a real
+bottleneck, and is roughly on par where the OS page cache already keeps shuffle files in RAM.
+
 ## Why this works as a plugin
 
 Spark's shuffle is pluggable via `spark.shuffle.manager`. The key realization is that the reduce
@@ -100,6 +126,45 @@ usual `spark.storage.decommission.enabled` / `spark.storage.decommission.shuffle
 - **Cross-node transfer:** blocks are served through the unchanged block-transfer layer as standard
   `ManagedBuffer`s (`NioManagedBuffer` for memory, `FileSegmentManagedBuffer` for spilled), so
   remote reads use exactly the same Netty path as built-in shuffle.
+
+## Benchmark
+
+`MemoryShuffleBenchmark` (in the test sources) is a self-contained E2E benchmark that runs both
+managers on a real `local-cluster` (separate executor JVMs, so blocks are fetched over the network)
+and reports wall-clock **plus** the shuffle metrics that isolate the shuffle itself -- aggregate
+shuffle *write time* and *fetch wait* captured from every task via a `SparkListener` -- with warmup
+iterations and median / min / stdev.
+
+```bash
+sbt 'Test/runMain org.apache.spark.shuffle.memory.MemoryShuffleBenchmark'
+
+# tunable via -Dbench.* (forwarded into the forked test JVM by build.sbt):
+sbt -Dbench.workload=repartition -Dbench.rows=6000000 -Dbench.valueSize=128 \
+  'Test/runMain org.apache.spark.shuffle.memory.MemoryShuffleBenchmark'
+```
+
+Knobs: `bench.workload` (`groupByKey` | `sortByKey` | `repartition`), `bench.rows`,
+`bench.valueSize`, `bench.partitions`, `bench.reducers`, `bench.executors`, `bench.cores`,
+`bench.execMemMb`, `bench.warmup`, `bench.iters`, `bench.localDir`.
+
+### Sample results (single machine, `local-cluster[2,2,2048m]`, SSD + warm page cache)
+
+| Workload | wall-clock (sort -> mem) | shuffle-write time (sort -> mem) |
+|----------|--------------------------|----------------------------------|
+| `groupByKey`, ~579 MB | 1.65 s -> 1.55 s (**+6%**) | 739 ms -> 27 ms (**~27x**) |
+| `repartition`, ~801 MB | 2.17 s -> 2.10 s (**+3%**) | 1328 ms -> 20 ms (**~67x**) |
+
+Reading these honestly: the **shuffle-write cost is 25-67x lower** (no data/index file
+serialization), but on a single box that is a minority of total job time and the read side is free
+because the built-in manager's "disk" files sit in the **OS page cache** -- so wall-clock only moves
+a few percent. That parity is the expected result on healthy local SSD, and the write-time metric is
+what demonstrates the mechanism.
+
+To make the wall-clock difference real (where this plugin is meant to help), run in an environment
+where local-disk IO is an actual cost: point the built-in shuffle at slow/throttled storage with
+`-Dbench.localDir=/path` (e.g. a `device-mapper delay` target or a cgroup-throttled mount) versus a
+tmpfs baseline; drop the page cache between runs (Linux `vm.drop_caches`, or a cgroup memory cap); or
+run on a real multi-node cluster with network-attached / slow local storage.
 
 ## Tests
 

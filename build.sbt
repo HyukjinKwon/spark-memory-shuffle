@@ -40,6 +40,11 @@ lazy val root = (project in file("."))
       "SPARK_TESTING" -> "1",
       "SPARK_SCALA_VERSION" -> "2.13"
     ),
+    // Forward any -Dbench.* properties given to sbt into the forked test JVM, so the benchmark
+    // (MemoryShuffleBenchmark) can be tuned from the command line despite Test / fork := true.
+    Test / javaOptions ++= sys.props.collect {
+      case (k, v) if k.startsWith("bench.") => s"-D$k=$v"
+    }.toSeq,
     Test / javaOptions ++= Seq(
       "--add-opens=java.base/java.lang=ALL-UNNAMED",
       "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
